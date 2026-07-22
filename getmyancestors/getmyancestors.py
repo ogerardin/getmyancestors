@@ -5,6 +5,7 @@ from __future__ import print_function
 import re
 import sys
 import time
+import logging
 from urllib.parse import unquote
 import getpass
 import asyncio
@@ -12,7 +13,7 @@ import argparse
 
 # local imports
 from getmyancestors.classes.tree import Tree
-from getmyancestors.classes.session import Session
+from getmyancestors.classes.session import Session, logger
 
 
 
@@ -179,15 +180,29 @@ def main():
                 "Unable to write %s: %s" % (settings_name, repr(exc)), file=sys.stderr
             )
 
+    # configure logging
+    log_format = "%(asctime)s %(levelname)s: %(message)s"
+    log_datefmt = "%Y-%m-%d %H:%M:%S"
+    handlers = []
+    handlers.append(logging.StreamHandler(sys.stderr))
+    if args.logfile:
+        handlers.append(logging.FileHandler(args.logfile, encoding="UTF-8"))
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format=log_format,
+        datefmt=log_datefmt,
+        handlers=handlers,
+    )
+
     # initialize a FamilySearch session and a family tree object
-    print("Login to FamilySearch...", file=sys.stderr)
+    logger.info("Login to FamilySearch...")
     fs = Session(
         args.username,
         args.password,
         args.client_id,
         args.redirect_uri,
         args.verbose,
-        args.logfile,
+        None,  # logfile handled by logging config
         args.timeout,
         args.rate_limit,
     )
@@ -202,13 +217,13 @@ def main():
             "/service/tree/tree-data/reservations/person/%s/ordinances" % fs.fid, {}, no_api=True
         )
         if not test or test["status"] != "OK":
-            print("Need an LDS account")
+            logger.warning("Need an LDS account")
             sys.exit(2)
 
     try:
         # add list of starting individuals to the family tree
         todo = args.individuals if args.individuals else [fs.fid]
-        print(_("Downloading starting individuals..."), file=sys.stderr)
+        logger.info(_("Downloading starting individuals..."))
         tree.add_indis(todo)
 
         # download ancestors
@@ -218,9 +233,8 @@ def main():
             if not todo:
                 break
             done |= todo
-            print(
-                _("Downloading %s. of generations of ancestors...") % (i + 1),
-                file=sys.stderr,
+            logger.info(
+                _("Downloading %s. of generations of ancestors...") % (i + 1)
             )
             todo = tree.add_parents(todo) - done
 
@@ -231,15 +245,14 @@ def main():
             if not todo:
                 break
             done |= todo
-            print(
-                _("Downloading %s. of generations of descendants...") % (i + 1),
-                file=sys.stderr,
+            logger.info(
+                _("Downloading %s. of generations of descendants...") % (i + 1)
             )
             todo = tree.add_children(todo) - done
 
         # download spouses
         if args.marriage:
-            print(_("Downloading spouses and marriage information..."), file=sys.stderr)
+            logger.info(_("Downloading spouses and marriage information..."))
             todo = set(tree.indi.keys())
             tree.add_spouses(todo)
 
@@ -260,7 +273,7 @@ def main():
                 await future
 
         loop = asyncio.get_event_loop()
-        print(
+        logger.info(
             _("Downloading notes")
             + (
                 (("," if args.get_contributors else _(" and")) + _(" ordinances"))
@@ -268,8 +281,7 @@ def main():
                 else ""
             )
             + (_(" and contributors") if args.get_contributors else "")
-            + "...",
-            file=sys.stderr,
+            + "..."
         )
         loop.run_until_complete(download_stuff(loop))
 
@@ -277,7 +289,8 @@ def main():
         # compute number for family relationships and print GEDCOM file
         tree.reset_num()
         tree.print(args.outfile)
-        print(
+        elapsed = round(time.time() - time_count)
+        logger.info(
             _(
                 "Downloaded %s individuals, %s families, %s sources and %s notes "
                 "in %s seconds with %s HTTP requests."
@@ -287,11 +300,11 @@ def main():
                 str(len(tree.fam)),
                 str(len(tree.sources)),
                 str(len(tree.notes)),
-                str(round(time.time() - time_count)),
+                str(elapsed),
                 str(fs.counter),
             ),
-            file=sys.stderr,
         )
+        logger.info("\nStatistics:\n%s", fs.stats.summary())
 
 
 if __name__ == "__main__":

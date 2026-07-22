@@ -1,8 +1,10 @@
 # global imports
 import sys
 import time
+import logging
 from urllib.parse import urlparse, parse_qs
 import webbrowser
+from collections import Counter
 
 import requests
 from fake_useragent import UserAgent
@@ -14,6 +16,40 @@ from getmyancestors.classes.translation import translations
 
 DEFAULT_CLIENT_ID = "a02j000000KTRjpAAH"
 DEFAULT_REDIRECT_URI = "https://misbach.github.io/fs-auth/index_raw.html"
+
+logger = logging.getLogger("getmyancestors")
+
+
+class Stats:
+    """Track export statistics"""
+
+    def __init__(self):
+        self.retry_count = 0
+        self.status_codes = Counter()
+        self.max_retries_reached = 0
+        self.start_time = time.time()
+
+    def record_status(self, status_code):
+        self.status_codes[status_code] += 1
+
+    def record_retry(self):
+        self.retry_count += 1
+
+    def record_max_retries(self):
+        self.max_retries_reached += 1
+
+    def elapsed(self):
+        return time.time() - self.start_time
+
+    def summary(self):
+        lines = []
+        lines.append("  Retries: %d" % self.retry_count)
+        lines.append("  Max retries reached: %d" % self.max_retries_reached)
+        if self.status_codes:
+            lines.append("  Status codes:")
+            for code, count in sorted(self.status_codes.items()):
+                lines.append("    %d: %d" % (code, count))
+        return "\n".join(lines)
 
 
 class Session(requests.Session):
@@ -34,6 +70,7 @@ class Session(requests.Session):
         logfile=False,
         timeout=60,
         rate_limit=None,
+        initial_backoff=10,
     ):
         super().__init__()
         self.username = username
@@ -43,9 +80,15 @@ class Session(requests.Session):
         self.verbose = verbose
         self.logfile = logfile
         self.timeout = timeout
+        self.initial_backoff = initial_backoff
         self.fid = self.lang = self.display_name = None
         self.counter = 0
+        self.stats = Stats()
         self.headers = {"User-Agent": UserAgent().firefox}
+        self.write_log(
+            "Config: timeout=%ds, initial_backoff=%ds, rate_limit=%s"
+            % (timeout, initial_backoff, rate_limit or "unlimited")
+        )
 
         # Apply a rate-limit (max # requests per second) to all endpoints
         if rate_limit:
@@ -59,13 +102,9 @@ class Session(requests.Session):
     def logged(self):
         return bool(self.cookies.get("fssessionid"))
 
-    def write_log(self, text):
+    def write_log(self, text, level=logging.INFO):
         """write text in the log file"""
-        log = "[%s]: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text)
-        if self.verbose:
-            sys.stderr.write(log)
-        if self.logfile:
-            self.logfile.write(log)
+        logger.log(level, text)
 
     def login(self):
         """retrieve FamilySearch session ID
@@ -171,43 +210,47 @@ class Session(requests.Session):
         retry_count = 0
         while True:
             try:
-                self.write_log("Downloading: " + url)
                 r = self.get(base + url, timeout=self.timeout, headers=headers)
+                self.write_log("GET %s -> %d" % (url, r.status_code))
             except requests.exceptions.ReadTimeout:
                 retry_count += 1
+                self.stats.record_retry()
                 if retry_count >= max_retries:
+                    self.stats.record_max_retries()
                     self.write_log(
                         "Max retries (%d) reached for %s, giving up"
                         % (max_retries, url)
                     )
                     return None
-                backoff = min(self.timeout * (2 ** (retry_count - 1)), 300)
+                backoff = min(self.initial_backoff * (2 ** (retry_count - 1)), 300)
                 self.write_log(
-                    "Read timed out (retry %d/%d in %ds)"
-                    % (retry_count, max_retries, backoff)
+                    "%s -> Read timed out (retry %d/%d in %ds)"
+                    % (url, retry_count, max_retries, backoff)
                 )
                 time.sleep(backoff)
                 continue
             except requests.exceptions.ConnectionError:
                 retry_count += 1
+                self.stats.record_retry()
                 if retry_count >= max_retries:
+                    self.stats.record_max_retries()
                     self.write_log(
                         "Max retries (%d) reached for %s, giving up"
                         % (max_retries, url)
                     )
                     return None
-                backoff = min(self.timeout * (2 ** (retry_count - 1)), 300)
+                backoff = min(self.initial_backoff * (2 ** (retry_count - 1)), 300)
                 self.write_log(
-                    "Connection aborted (retry %d/%d in %ds)"
-                    % (retry_count, max_retries, backoff)
+                    "%s -> Connection aborted (retry %d/%d in %ds)"
+                    % (url, retry_count, max_retries, backoff)
                 )
                 time.sleep(backoff)
                 continue
-            self.write_log("Status code: %s" % r.status_code)
+            self.stats.record_status(r.status_code)
             if r.status_code == 204:
                 return None
             if r.status_code in {404, 405, 410, 500}:
-                self.write_log("WARNING: " + url)
+                logger.warning("%s -> HTTP %d", url, r.status_code)
                 return None
             if r.status_code == 401:
                 self.login()
@@ -221,27 +264,30 @@ class Session(requests.Session):
                         and r.json()["errors"][0]["message"]
                         == "Unable to get ordinances."
                     ):
-                        self.write_log(
+                        logger.warning(
                             "Unable to get ordinances. "
                             "Try with an LDS account or without option -c."
                         )
                         return "error"
-                    self.write_log(
-                        "WARNING: code 403 from %s %s"
-                        % (url, r.json()["errors"][0]["message"] or "")
+                    logger.warning(
+                        "%s -> HTTP 403: %s",
+                        url,
+                        r.json()["errors"][0]["message"] or "",
                     )
                     return None
                 retry_count += 1
+                self.stats.record_retry()
                 if retry_count >= max_retries:
+                    self.stats.record_max_retries()
                     self.write_log(
                         "Max retries (%d) reached for %s (HTTP %d), giving up"
                         % (max_retries, url, r.status_code)
                     )
                     return None
-                backoff = min(self.timeout * (2 ** (retry_count - 1)), 300)
+                backoff = min(self.initial_backoff * (2 ** (retry_count - 1)), 300)
                 self.write_log(
-                    "HTTPError %d (retry %d/%d in %ds)"
-                    % (r.status_code, retry_count, max_retries, backoff)
+                    "%s -> HTTP %d (retry %d/%d in %ds)"
+                    % (url, r.status_code, retry_count, max_retries, backoff)
                 )
                 time.sleep(backoff)
                 continue

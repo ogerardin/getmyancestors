@@ -2,6 +2,7 @@ import sys
 import re
 import time
 import asyncio
+import concurrent.futures
 from urllib.parse import unquote
 
 # global imports
@@ -663,6 +664,8 @@ class Tree:
 
         new_fids = [fid for fid in fids if fid and fid not in self.indi]
         loop = asyncio.new_event_loop()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
+        loop.set_default_executor(executor)
         asyncio.set_event_loop(loop)
         while new_fids:
             data = self.fs.get_url(
