@@ -167,16 +167,41 @@ class Session(requests.Session):
         base = "https://api.familysearch.org"
         if no_api:
             base = "https://familysearch.org"
+        max_retries = 5
+        retry_count = 0
         while True:
             try:
                 self.write_log("Downloading: " + url)
                 r = self.get(base + url, timeout=self.timeout, headers=headers)
             except requests.exceptions.ReadTimeout:
-                self.write_log("Read timed out")
+                retry_count += 1
+                if retry_count >= max_retries:
+                    self.write_log(
+                        "Max retries (%d) reached for %s, giving up"
+                        % (max_retries, url)
+                    )
+                    return None
+                backoff = min(self.timeout * (2 ** (retry_count - 1)), 300)
+                self.write_log(
+                    "Read timed out (retry %d/%d in %ds)"
+                    % (retry_count, max_retries, backoff)
+                )
+                time.sleep(backoff)
                 continue
             except requests.exceptions.ConnectionError:
-                self.write_log("Connection aborted")
-                time.sleep(self.timeout)
+                retry_count += 1
+                if retry_count >= max_retries:
+                    self.write_log(
+                        "Max retries (%d) reached for %s, giving up"
+                        % (max_retries, url)
+                    )
+                    return None
+                backoff = min(self.timeout * (2 ** (retry_count - 1)), 300)
+                self.write_log(
+                    "Connection aborted (retry %d/%d in %ds)"
+                    % (retry_count, max_retries, backoff)
+                )
+                time.sleep(backoff)
                 continue
             self.write_log("Status code: %s" % r.status_code)
             if r.status_code == 204:
@@ -190,7 +215,6 @@ class Session(requests.Session):
             try:
                 r.raise_for_status()
             except requests.exceptions.HTTPError:
-                self.write_log("HTTPError")
                 if r.status_code == 403:
                     if (
                         "message" in r.json()["errors"][0]
@@ -207,7 +231,19 @@ class Session(requests.Session):
                         % (url, r.json()["errors"][0]["message"] or "")
                     )
                     return None
-                time.sleep(self.timeout)
+                retry_count += 1
+                if retry_count >= max_retries:
+                    self.write_log(
+                        "Max retries (%d) reached for %s (HTTP %d), giving up"
+                        % (max_retries, url, r.status_code)
+                    )
+                    return None
+                backoff = min(self.timeout * (2 ** (retry_count - 1)), 300)
+                self.write_log(
+                    "HTTPError %d (retry %d/%d in %ds)"
+                    % (r.status_code, retry_count, max_retries, backoff)
+                )
+                time.sleep(backoff)
                 continue
             try:
                 return r.json()
