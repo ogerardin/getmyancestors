@@ -1,4 +1,5 @@
 # global imports
+import random
 import sys
 import time
 import logging
@@ -218,13 +219,14 @@ class Session(requests.Session):
                 if retry_count >= max_retries:
                     self.stats.record_max_retries()
                     self.write_log(
-                        "Max retries (%d) reached for %s, giving up"
-                        % (max_retries, url)
+                        "GET %s -> Max retries (%d) reached, giving up"
+                        % (url, max_retries),
+                        level=logging.WARNING,
                     )
                     return None
-                backoff = min(self.initial_backoff * (2 ** (retry_count - 1)), 300)
+                backoff = random.uniform(0, min(self.initial_backoff * (2 ** (retry_count - 1)), 300))
                 self.write_log(
-                    "%s -> Read timed out (retry %d/%d in %ds)"
+                    "GET %s -> Read timed out (retry %d/%d in %ds)"
                     % (url, retry_count, max_retries, backoff)
                 )
                 time.sleep(backoff)
@@ -235,13 +237,14 @@ class Session(requests.Session):
                 if retry_count >= max_retries:
                     self.stats.record_max_retries()
                     self.write_log(
-                        "Max retries (%d) reached for %s, giving up"
-                        % (max_retries, url)
+                        "GET %s -> Max retries (%d) reached, giving up"
+                        % (url, max_retries),
+                        level=logging.WARNING,
                     )
                     return None
-                backoff = min(self.initial_backoff * (2 ** (retry_count - 1)), 300)
+                backoff = random.uniform(0, min(self.initial_backoff * (2 ** (retry_count - 1)), 300))
                 self.write_log(
-                    "%s -> Connection aborted (retry %d/%d in %ds)"
+                    "GET %s -> Connection aborted (retry %d/%d in %ds)"
                     % (url, retry_count, max_retries, backoff)
                 )
                 time.sleep(backoff)
@@ -250,7 +253,7 @@ class Session(requests.Session):
             if r.status_code == 204:
                 return None
             if r.status_code in {404, 405, 410, 500}:
-                logger.warning("%s -> HTTP %d", url, r.status_code)
+                logger.warning("GET %s -> HTTP %d", url, r.status_code)
                 return None
             if r.status_code == 401:
                 self.login()
@@ -270,7 +273,7 @@ class Session(requests.Session):
                         )
                         return "error"
                     logger.warning(
-                        "%s -> HTTP 403: %s",
+                        "GET %s -> HTTP 403: %s",
                         url,
                         r.json()["errors"][0]["message"] or "",
                     )
@@ -280,13 +283,14 @@ class Session(requests.Session):
                 if retry_count >= max_retries:
                     self.stats.record_max_retries()
                     self.write_log(
-                        "Max retries (%d) reached for %s (HTTP %d), giving up"
-                        % (max_retries, url, r.status_code)
+                        "GET %s -> Max retries (%d) reached (HTTP %d), giving up"
+                        % (url, max_retries, r.status_code),
+                        level=logging.WARNING,
                     )
                     return None
-                backoff = min(self.initial_backoff * (2 ** (retry_count - 1)), 300)
+                backoff = random.uniform(0, min(self.initial_backoff * (2 ** (retry_count - 1)), 300))
                 self.write_log(
-                    "%s -> HTTP %d (retry %d/%d in %ds)"
+                    "GET %s -> HTTP %d (retry %d/%d in %ds)"
                     % (url, r.status_code, retry_count, max_retries, backoff)
                 )
                 time.sleep(backoff)
@@ -294,7 +298,7 @@ class Session(requests.Session):
             try:
                 return r.json()
             except Exception as e:
-                self.write_log("WARNING: corrupted file from %s, error: %s" % (url, e))
+                self.write_log("GET %s -> Corrupted response: %s" % (url, e), level=logging.WARNING)
                 return None
 
     def set_current(self):

@@ -181,7 +181,7 @@ def main():
             )
 
     # configure logging
-    log_format = "%(asctime)s %(levelname)s: %(message)s"
+    log_format = "%(asctime)s %(levelname)-8s %(message)s"
     log_datefmt = "%Y-%m-%d %H:%M:%S"
     handlers = []
     handlers.append(logging.StreamHandler(sys.stderr))
@@ -193,6 +193,8 @@ def main():
         datefmt=log_datefmt,
         handlers=handlers,
     )
+    for name in ("urllib3", "requests_ratelimiter"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
     # initialize a FamilySearch session and a family tree object
     logger.info("Login to FamilySearch...")
@@ -234,7 +236,7 @@ def main():
                 break
             done |= todo
             logger.info(
-                _("Downloading %s. of generations of ancestors...") % (i + 1)
+                _("Downloading generation %s of ancestors...") % (i + 1)
             )
             todo = tree.add_parents(todo) - done
 
@@ -246,7 +248,7 @@ def main():
                 break
             done |= todo
             logger.info(
-                _("Downloading %s. of generations of descendants...") % (i + 1)
+                _("Downloading generation %s of descendants...") % (i + 1)
             )
             todo = tree.add_children(todo) - done
 
