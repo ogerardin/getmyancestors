@@ -1,5 +1,6 @@
 import sys
 import re
+import threading
 import time
 import asyncio
 import concurrent.futures
@@ -352,38 +353,49 @@ class Indi:
                     else:
                         self.facts.add(Fact(x, self.tree))
             if "sources" in data:
+                def process_sources(sources_data):
+                    if sources_data:
+                        with self.tree.lock:
+                            quotes = dict()
+                            for quote in sources_data["persons"][0]["sources"]:
+                                quotes[quote["descriptionId"]] = (
+                                    quote["attribution"]["changeMessage"]
+                                    if "changeMessage" in quote["attribution"]
+                                    else None
+                                )
+                            for source in sources_data["sourceDescriptions"]:
+                                if source["id"] not in self.tree.sources:
+                                    self.tree.sources[source["id"]] = Source(source, self.tree)
+                                self.sources.add(
+                                    (self.tree.sources[source["id"]], quotes[source["id"]])
+                                )
+
                 sources = self.tree.fs.get_url(
-                    "/platform/tree/persons/%s/sources" % self.fid
+                    "/platform/tree/persons/%s/sources" % self.fid,
+                    callback=process_sources
                 )
                 if sources:
-                    quotes = dict()
-                    for quote in sources["persons"][0]["sources"]:
-                        quotes[quote["descriptionId"]] = (
-                            quote["attribution"]["changeMessage"]
-                            if "changeMessage" in quote["attribution"]
-                            else None
-                        )
-                    for source in sources["sourceDescriptions"]:
-                        if source["id"] not in self.tree.sources:
-                            self.tree.sources[source["id"]] = Source(source, self.tree)
-                        self.sources.add(
-                            (self.tree.sources[source["id"]], quotes[source["id"]])
-                        )
+                    process_sources(sources)
             for evidence in data.get("evidence", []):
                 memory_id, *_ = evidence["id"].partition("-")
                 url = "/platform/memories/memories/%s" % memory_id
-                memorie = self.tree.fs.get_url(url)
-                if memorie and "sourceDescriptions" in memorie:
-                    for x in memorie["sourceDescriptions"]:
-                        if x["mediaType"] == "text/plain":
-                            text = "\n".join(
-                                val.get("value", "")
-                                for val in x.get("titles", [])
-                                + x.get("descriptions", [])
-                            )
-                            self.notes.add(Note(text, self.tree))
-                        else:
-                            self.memories.add(Memorie(x))
+
+                def process_memory(memorie_data):
+                    if memorie_data and "sourceDescriptions" in memorie_data:
+                        for x in memorie_data["sourceDescriptions"]:
+                            if x["mediaType"] == "text/plain":
+                                text = "\n".join(
+                                    val.get("value", "")
+                                    for val in x.get("titles", [])
+                                    + x.get("descriptions", [])
+                                )
+                                self.notes.add(Note(text, self.tree))
+                            else:
+                                self.memories.add(Memorie(x))
+
+                memorie = self.tree.fs.get_url(url, callback=process_memory)
+                if memorie:
+                    process_memory(memorie)
 
     def add_fams(self, fams):
         """add family fid (for spouse or parent)"""
@@ -395,12 +407,19 @@ class Indi:
 
     def get_notes(self):
         """retrieve individual notes"""
-        notes = self.tree.fs.get_url("/platform/tree/persons/%s/notes" % self.fid)
+        def process_notes(notes_data):
+            if notes_data:
+                for n in notes_data["persons"][0]["notes"]:
+                    text_note = "=== %s ===\n" % n["subject"] if "subject" in n else ""
+                    text_note += n["text"] + "\n" if "text" in n else ""
+                    self.notes.add(Note(text_note, self.tree))
+
+        notes = self.tree.fs.get_url(
+            "/platform/tree/persons/%s/notes" % self.fid,
+            callback=process_notes
+        )
         if notes:
-            for n in notes["persons"][0]["notes"]:
-                text_note = "=== %s ===\n" % n["subject"] if "subject" in n else ""
-                text_note += n["text"] + "\n" if "text" in n else ""
-                self.notes.add(Note(text_note, self.tree))
+            process_notes(notes)
 
     def get_ordinances(self):
         """retrieve LDS ordinances
@@ -574,14 +593,19 @@ class Fam:
     def get_notes(self):
         """retrieve marriage notes"""
         if self.fid:
+            def process_notes(notes_data):
+                if notes_data:
+                    for n in notes_data["relationships"][0]["notes"]:
+                        text_note = "=== %s ===\n" % n["subject"] if "subject" in n else ""
+                        text_note += n["text"] + "\n" if "text" in n else ""
+                        self.notes.add(Note(text_note, self.tree))
+
             notes = self.tree.fs.get_url(
-                "/platform/tree/couple-relationships/%s/notes" % self.fid
+                "/platform/tree/couple-relationships/%s/notes" % self.fid,
+                callback=process_notes
             )
             if notes:
-                for n in notes["relationships"][0]["notes"]:
-                    text_note = "=== %s ===\n" % n["subject"] if "subject" in n else ""
-                    text_note += n["text"] + "\n" if "text" in n else ""
-                    self.notes.add(Note(text_note, self.tree))
+                process_notes(notes)
 
     def get_contributors(self):
         """retrieve contributors"""
@@ -637,6 +661,7 @@ class Tree:
 
     def __init__(self, fs=None):
         self.fs = fs
+        self.lock = threading.Lock()
         self.threads = fs.threads if fs else 20
         self.indi = dict()
         self.fam = dict()

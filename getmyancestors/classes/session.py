@@ -1,6 +1,8 @@
 # global imports
+import queue
 import random
 import sys
+import threading
 import time
 import logging
 from urllib.parse import urlparse, parse_qs
@@ -44,6 +46,115 @@ class Stats:
         return time.time() - self.start_time
 
 
+class RetryQueue:
+    """Thread-safe queue for failed requests"""
+
+    def __init__(self):
+        self.queue = queue.Queue()
+        self._count = 0
+        self._lock = threading.Lock()
+
+    def put(self, url, headers, callback, retry_count=0, no_api=False):
+        with self._lock:
+            self._count += 1
+        self.queue.put((url, headers, callback, retry_count, no_api))
+
+    def get(self, timeout=None):
+        try:
+            item = self.queue.get(timeout=timeout)
+            with self._lock:
+                self._count -= 1
+            return item
+        except queue.Empty:
+            return None
+
+    @property
+    def pending(self):
+        with self._lock:
+            return self._count
+
+
+class RetryThread(threading.Thread):
+    """Background thread that retries failed requests"""
+
+    def __init__(self, session, retry_queue, retry_delay=30, retry_max=10):
+        super().__init__(daemon=True)
+        self.session = session
+        self.retry_queue = retry_queue
+        self.retry_delay = retry_delay
+        self.retry_max = retry_max
+        self._stop_event = threading.Event()
+
+    def run(self):
+        while not self._stop_event.is_set() or self.retry_queue.pending > 0:
+            item = self.retry_queue.get(timeout=1)
+            if item is None:
+                continue
+
+            url, headers, callback, retry_count, no_api = item
+
+            time.sleep(self.retry_delay)
+
+            base = "https://api.familysearch.org" if not no_api else "https://familysearch.org"
+            try:
+                r = self.session.get(base + url, timeout=self.session.timeout, headers=headers)
+                self.session.stats.record_status(r.status_code)
+
+                if r.status_code == 200:
+                    try:
+                        data = r.json()
+                        callback(data)
+                    except Exception as e:
+                        logger.warning("Retry GET %s -> callback error: %s", url, e)
+                    self.session.stats.record_retry()
+                    logger.info("Retry succeeded: GET %s -> 200", url)
+
+                elif r.status_code in {429, 503}:
+                    if retry_count < self.retry_max:
+                        self.retry_queue.put(url, headers, callback, retry_count + 1, no_api)
+                        logger.info("Retry %d/%d queued: GET %s -> %d",
+                                    retry_count + 1, self.retry_max, url, r.status_code)
+                    else:
+                        self.session.stats.record_max_retries()
+                        logger.warning("Retry exhausted: GET %s -> %d", url, r.status_code)
+
+                elif r.status_code in {404, 405, 410, 500}:
+                    logger.warning("Retry aborted (permanent): GET %s -> %d", url, r.status_code)
+
+                else:
+                    if retry_count < self.retry_max:
+                        self.retry_queue.put(url, headers, callback, retry_count + 1, no_api)
+                        logger.info("Retry %d/%d queued: GET %s -> %d",
+                                    retry_count + 1, self.retry_max, url, r.status_code)
+                    else:
+                        self.session.stats.record_max_retries()
+                        logger.warning("Retry exhausted: GET %s -> %d", url, r.status_code)
+
+            except requests.exceptions.ReadTimeout:
+                if retry_count < self.retry_max:
+                    self.retry_queue.put(url, headers, callback, retry_count + 1, no_api)
+                    logger.info("Retry %d/%d queued: GET %s -> timeout",
+                                retry_count + 1, self.retry_max, url)
+                else:
+                    self.session.stats.record_max_retries()
+                    logger.warning("Retry exhausted: GET %s -> timeout", url)
+
+            except requests.exceptions.ConnectionError:
+                if retry_count < self.retry_max:
+                    self.retry_queue.put(url, headers, callback, retry_count + 1, no_api)
+                    logger.info("Retry %d/%d queued: GET %s -> connection error",
+                                retry_count + 1, self.retry_max, url)
+                else:
+                    self.session.stats.record_max_retries()
+                    logger.warning("Retry exhausted: GET %s -> connection error", url)
+
+            except Exception as e:
+                logger.warning("Retry GET %s -> unexpected error: %s", url, e)
+
+    def stop(self):
+        self._stop_event.set()
+
+
 class Session(requests.Session):
     """Create a FamilySearch session
     :param username and password: valid FamilySearch credentials
@@ -65,6 +176,8 @@ class Session(requests.Session):
         initial_backoff=10,
         threads=20,
         max_retries=8,
+        retry_delay=30,
+        retry_max=10,
     ):
         super().__init__()
         self.username = username
@@ -87,9 +200,14 @@ class Session(requests.Session):
         self.mount('http://', pool_adapter)
         self.mount('https://', pool_adapter)
 
+        # Retry thread for failed requests
+        self.retry_queue = RetryQueue()
+        self.retry_thread = RetryThread(self, self.retry_queue, retry_delay, retry_max)
+        self.retry_thread.start()
+
         self.write_log(
-            "Config: timeout=%ds, initial_backoff=%ds, rate_limit=%s, threads=%d, max_retries=%d"
-            % (timeout, initial_backoff, rate_limit or "unlimited", threads, max_retries)
+            "Config: timeout=%ds, initial_backoff=%ds, rate_limit=%s, threads=%d, max_retries=%d, retry_delay=%ds, retry_max=%d"
+            % (timeout, initial_backoff, rate_limit or "unlimited", threads, max_retries, retry_delay, retry_max)
         )
 
         # Apply a rate-limit (max # requests per second) to all endpoints
@@ -199,8 +317,10 @@ class Session(requests.Session):
                 self.set_current()
                 break
 
-    def get_url(self, url, headers=None, no_api=False):
-        """retrieve JSON structure from a FamilySearch URL"""
+    def get_url(self, url, headers=None, no_api=False, callback=None):
+        """retrieve JSON structure from a FamilySearch URL
+        :param callback: if provided, failed requests are queued for background retry
+        """
         self.counter += 1
         if headers is None:
             headers = {"Accept": "application/x-gedcomx-v1+json"}
@@ -217,12 +337,16 @@ class Session(requests.Session):
                 retry_count += 1
                 self.stats.record_retry()
                 if retry_count >= max_retries:
-                    self.stats.record_max_retries()
-                    self.write_log(
-                        "GET %s -> Max retries (%d) reached, giving up"
-                        % (url, max_retries),
-                        level=logging.WARNING,
-                    )
+                    if callback:
+                        self.retry_queue.put(url, headers, callback, 0, no_api)
+                        logger.info("Queued for retry: GET %s -> HTTP %d", url, r.status_code)
+                    else:
+                        self.stats.record_max_retries()
+                        self.write_log(
+                            "GET %s -> Max retries (%d) reached (HTTP %d), giving up"
+                            % (url, max_retries, r.status_code),
+                            level=logging.WARNING,
+                        )
                     return None
                 backoff = random.uniform(0, min(self.initial_backoff * (2 ** (retry_count - 1)), 300))
                 self.write_log(
@@ -235,12 +359,16 @@ class Session(requests.Session):
                 retry_count += 1
                 self.stats.record_retry()
                 if retry_count >= max_retries:
-                    self.stats.record_max_retries()
-                    self.write_log(
-                        "GET %s -> Max retries (%d) reached, giving up"
-                        % (url, max_retries),
-                        level=logging.WARNING,
-                    )
+                    if callback:
+                        self.retry_queue.put(url, headers, callback, 0, no_api)
+                        logger.info("Queued for retry: GET %s", url)
+                    else:
+                        self.stats.record_max_retries()
+                        self.write_log(
+                            "GET %s -> Max retries (%d) reached, giving up"
+                            % (url, max_retries),
+                            level=logging.WARNING,
+                        )
                     return None
                 backoff = random.uniform(0, min(self.initial_backoff * (2 ** (retry_count - 1)), 300))
                 self.write_log(
@@ -282,12 +410,16 @@ class Session(requests.Session):
                 retry_count += 1
                 self.stats.record_retry()
                 if retry_count >= max_retries:
-                    self.stats.record_max_retries()
-                    self.write_log(
-                        "GET %s -> Max retries (%d) reached (HTTP %d), giving up"
-                        % (url, max_retries, r.status_code),
-                        level=logging.WARNING,
-                    )
+                    if callback:
+                        self.retry_queue.put(url, headers, callback, 0, no_api)
+                        logger.info("Queued for retry: GET %s", url)
+                    else:
+                        self.stats.record_max_retries()
+                        self.write_log(
+                            "GET %s -> Max retries (%d) reached, giving up"
+                            % (url, max_retries),
+                            level=logging.WARNING,
+                        )
                     return None
                 backoff = random.uniform(0, min(self.initial_backoff * (2 ** (retry_count - 1)), 300))
                 self.write_log(

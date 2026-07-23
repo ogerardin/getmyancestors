@@ -138,6 +138,20 @@ def main():
         help="max retries for failed requests [8]",
     )
     parser.add_argument(
+        "--retry-delay",
+        metavar="<INT>",
+        type=int,
+        default=30,
+        help="seconds between retry attempts [30]",
+    )
+    parser.add_argument(
+        "--retry-max",
+        metavar="<INT>",
+        type=int,
+        default=10,
+        help="max retries in background retry thread [10]",
+    )
+    parser.add_argument(
         "--client_id", metavar="<STR>", type=str, help="Use Specific Client ID"
     )
     parser.add_argument(
@@ -223,6 +237,8 @@ def main():
         args.rate_limit,
         threads=args.threads,
         max_retries=args.max_retries,
+        retry_delay=args.retry_delay,
+        retry_max=args.retry_max,
     )
     if not fs.logged:
         sys.exit(2)
@@ -304,6 +320,15 @@ def main():
         loop.run_until_complete(download_stuff(loop))
 
     finally:
+        # Wait for retry thread to finish recovering failed requests
+        fs.retry_thread.stop()
+        queued = fs.retry_queue.pending
+        if queued:
+            logger.info("Waiting for retry thread (%d requests still queued)...", queued)
+        fs.retry_thread.join(timeout=300)
+        if fs.retry_queue.pending:
+            logger.warning("Retry thread timed out with %d requests still queued", fs.retry_queue.pending)
+
         # compute number for family relationships and print GEDCOM file
         tree.reset_num()
         tree.print(args.outfile)
@@ -322,8 +347,9 @@ def main():
                 str(fs.counter),
             ),
         )
-        logger.info("Statistics: retries=%d, max_retries=%d, status_codes=%s",
-                     fs.stats.retry_count, fs.stats.max_retries_reached,
+        retry_remaining = fs.retry_queue.pending
+        logger.info("Statistics: retries=%d, max_retries=%d, retry_queue=%d, status_codes=%s",
+                     fs.stats.retry_count, fs.stats.max_retries_reached, retry_remaining,
                      dict(fs.stats.status_codes))
 
 
