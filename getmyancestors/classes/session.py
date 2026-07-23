@@ -1,6 +1,5 @@
 # global imports
 import queue
-import random
 import sys
 import threading
 import time
@@ -46,22 +45,22 @@ class Stats:
         return time.time() - self.start_time
 
 
-class RetryQueue:
-    """Thread-safe queue for failed requests"""
+class RequestQueue:
+    """Thread-safe FIFO queue for all requests (initial + retries)"""
 
     def __init__(self):
-        self.queue = queue.Queue()
+        self._queue = queue.Queue()
         self._count = 0
         self._lock = threading.Lock()
 
-    def put(self, url, headers, callback, retry_count=0, no_api=False):
+    def put(self, item):
         with self._lock:
             self._count += 1
-        self.queue.put((url, headers, callback, retry_count, no_api))
+        self._queue.put(item)
 
     def get(self, timeout=None):
         try:
-            item = self.queue.get(timeout=timeout)
+            item = self._queue.get(timeout=timeout)
             with self._lock:
                 self._count -= 1
             return item
@@ -74,85 +73,125 @@ class RetryQueue:
             return self._count
 
 
-class RetryThread(threading.Thread):
-    """Background thread that retries failed requests"""
+def _worker_loop(session, request_queue, stats, stop_event):
+    """Worker thread: dequeues requests, processes them, handles retries"""
+    while not stop_event.is_set() or request_queue.pending > 0:
+        item = request_queue.get(timeout=1)
+        if item is None:
+            continue
 
-    def __init__(self, session, retry_queue, retry_delay=30, retry_max=10):
-        super().__init__(daemon=True)
-        self.session = session
-        self.retry_queue = retry_queue
-        self.retry_delay = retry_delay
-        self.retry_max = retry_max
-        self._stop_event = threading.Event()
+        (url, headers, callback, attempt,
+         max_attempts, fixed_delay, event, no_api) = item
 
-    def run(self):
-        while not self._stop_event.is_set() or self.retry_queue.pending > 0:
-            item = self.retry_queue.get(timeout=1)
-            if item is None:
-                continue
+        # Apply fixed delay (from Retry-After header)
+        if fixed_delay:
+            time.sleep(fixed_delay)
 
-            url, headers, callback, retry_count, no_api = item
+        base = "https://familysearch.org" if no_api else "https://api.familysearch.org"
+        try:
+            r = session.get(base + url, timeout=session.timeout, headers=headers)
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError):
+            if attempt < max_attempts:
+                stats.record_retry()
+                request_queue.put(
+                    (url, headers, callback, attempt + 1, max_attempts, 0, event, no_api)
+                )
+                logger.info("GET %s -> timeout (queued retry %d/%d)",
+                            url, attempt + 1, max_attempts)
+            else:
+                stats.record_max_retries()
+                logger.warning("GET %s -> max attempts (%d) reached (timeout)",
+                               url, max_attempts)
+                callback(None)
+                if event:
+                    event.set()
+            continue
 
-            time.sleep(self.retry_delay)
+        stats.record_status(r.status_code)
 
-            base = "https://api.familysearch.org" if not no_api else "https://familysearch.org"
+        if r.status_code == 200:
+            if attempt > 0:
+                logger.info("GET %s -> 200 (retry %d/%d)", url, attempt, max_attempts)
+            else:
+                logger.info("GET %s -> 200", url)
             try:
-                r = self.session.get(base + url, timeout=self.session.timeout, headers=headers)
-                self.session.stats.record_status(r.status_code)
-
-                if r.status_code == 200:
-                    try:
-                        data = r.json()
-                        callback(data)
-                    except Exception as e:
-                        logger.warning("Retry GET %s -> callback error: %s", url, e)
-                    self.session.stats.record_retry()
-                    logger.info("Retry succeeded: GET %s -> 200", url)
-
-                elif r.status_code in {429, 503}:
-                    if retry_count < self.retry_max:
-                        self.retry_queue.put(url, headers, callback, retry_count + 1, no_api)
-                        logger.info("Retry %d/%d queued: GET %s -> %d",
-                                    retry_count + 1, self.retry_max, url, r.status_code)
-                    else:
-                        self.session.stats.record_max_retries()
-                        logger.warning("Retry exhausted: GET %s -> %d", url, r.status_code)
-
-                elif r.status_code in {404, 405, 410, 500}:
-                    logger.warning("Retry aborted (permanent): GET %s -> %d", url, r.status_code)
-
-                else:
-                    if retry_count < self.retry_max:
-                        self.retry_queue.put(url, headers, callback, retry_count + 1, no_api)
-                        logger.info("Retry %d/%d queued: GET %s -> %d",
-                                    retry_count + 1, self.retry_max, url, r.status_code)
-                    else:
-                        self.session.stats.record_max_retries()
-                        logger.warning("Retry exhausted: GET %s -> %d", url, r.status_code)
-
-            except requests.exceptions.ReadTimeout:
-                if retry_count < self.retry_max:
-                    self.retry_queue.put(url, headers, callback, retry_count + 1, no_api)
-                    logger.info("Retry %d/%d queued: GET %s -> timeout",
-                                retry_count + 1, self.retry_max, url)
-                else:
-                    self.session.stats.record_max_retries()
-                    logger.warning("Retry exhausted: GET %s -> timeout", url)
-
-            except requests.exceptions.ConnectionError:
-                if retry_count < self.retry_max:
-                    self.retry_queue.put(url, headers, callback, retry_count + 1, no_api)
-                    logger.info("Retry %d/%d queued: GET %s -> connection error",
-                                retry_count + 1, self.retry_max, url)
-                else:
-                    self.session.stats.record_max_retries()
-                    logger.warning("Retry exhausted: GET %s -> connection error", url)
-
+                callback(r.json())
             except Exception as e:
-                logger.warning("Retry GET %s -> unexpected error: %s", url, e)
+                logger.warning("GET %s -> callback error: %s", url, e)
+                callback(None)
+            if event:
+                event.set()
 
-    def stop(self):
-        self._stop_event.set()
+        elif r.status_code == 204:
+            logger.info("GET %s -> 204", url)
+            callback(None)
+            if event:
+                event.set()
+
+        elif r.status_code in {429, 503}:
+            retry_after = r.headers.get("Retry-After")
+            new_fixed_delay = int(retry_after) if retry_after else 0
+            if attempt < max_attempts:
+                stats.record_retry()
+                request_queue.put(
+                    (url, headers, callback, attempt + 1, max_attempts,
+                     new_fixed_delay, event, no_api)
+                )
+                logger.info("GET %s -> %d (queued retry %d/%d, Retry-After=%s)",
+                            url, r.status_code, attempt + 1, max_attempts,
+                            retry_after or "none")
+            else:
+                stats.record_max_retries()
+                logger.warning("GET %s -> max attempts (%d) reached (HTTP %d)",
+                               url, max_attempts, r.status_code)
+                callback(None)
+                if event:
+                    event.set()
+
+        elif r.status_code in {404, 405, 410, 500}:
+            logger.warning("GET %s -> HTTP %d", url, r.status_code)
+            callback(None)
+            if event:
+                event.set()
+
+        elif r.status_code == 401:
+            logger.info("GET %s -> 401, re-logging in", url)
+            session.login()
+            request_queue.put(
+                (url, headers, callback, attempt, max_attempts, 0, event, no_api)
+            )
+
+        elif r.status_code == 403:
+            try:
+                msg = r.json()["errors"][0].get("message", "")
+                if msg == "Unable to get ordinances.":
+                    logger.warning("Unable to get ordinances. "
+                                   "Try with an LDS account or without option -c.")
+                    callback("error")
+                else:
+                    logger.warning("GET %s -> HTTP 403: %s", url, msg)
+                    callback(None)
+            except Exception:
+                logger.warning("GET %s -> HTTP 403", url)
+                callback(None)
+            if event:
+                event.set()
+
+        else:
+            if attempt < max_attempts:
+                stats.record_retry()
+                request_queue.put(
+                    (url, headers, callback, attempt + 1, max_attempts, 0, event, no_api)
+                )
+                logger.info("GET %s -> %d (queued retry %d/%d)",
+                            url, r.status_code, attempt + 1, max_attempts)
+            else:
+                stats.record_max_retries()
+                logger.warning("GET %s -> max attempts (%d) reached (HTTP %d)",
+                               url, max_attempts, r.status_code)
+                callback(None)
+                if event:
+                    event.set()
 
 
 class Session(requests.Session):
@@ -173,11 +212,8 @@ class Session(requests.Session):
         logfile=False,
         timeout=60,
         rate_limit=None,
-        initial_backoff=10,
         threads=20,
-        max_retries=8,
-        retry_delay=30,
-        retry_max=10,
+        max_attempts=10,
     ):
         super().__init__()
         self.username = username
@@ -187,9 +223,8 @@ class Session(requests.Session):
         self.verbose = verbose
         self.logfile = logfile
         self.timeout = timeout
-        self.initial_backoff = initial_backoff
         self.threads = threads
-        self.max_retries = max_retries
+        self.max_attempts = max_attempts
         self.fid = self.lang = self.display_name = None
         self.counter = 0
         self.stats = Stats()
@@ -200,21 +235,29 @@ class Session(requests.Session):
         self.mount('http://', pool_adapter)
         self.mount('https://', pool_adapter)
 
-        # Retry thread for failed requests
-        self.retry_queue = RetryQueue()
-        self.retry_thread = RetryThread(self, self.retry_queue, retry_delay, retry_max)
-        self.retry_thread.start()
-
-        self.write_log(
-            "Config: timeout=%ds, initial_backoff=%ds, rate_limit=%s, threads=%d, max_retries=%d, retry_delay=%ds, retry_max=%d"
-            % (timeout, initial_backoff, rate_limit or "unlimited", threads, max_retries, retry_delay, retry_max)
-        )
-
         # Apply a rate-limit (max # requests per second) to all endpoints
         if rate_limit:
             adapter = LimiterAdapter(per_second=rate_limit)
             self.mount('http://', adapter)
             self.mount('https://', adapter)
+
+        # Start worker threads (unified pool for requests + retries)
+        self._request_queue = RequestQueue()
+        self._stop_workers = threading.Event()
+        self._workers = []
+        for _ in range(threads):
+            t = threading.Thread(
+                target=_worker_loop,
+                args=(self, self._request_queue, self.stats, self._stop_workers),
+                daemon=True,
+            )
+            t.start()
+            self._workers.append(t)
+
+        self.write_log(
+            "Config: timeout=%ds, rate_limit=%s, threads=%d, max_attempts=%d"
+            % (timeout, rate_limit or "unlimited", threads, max_attempts)
+        )
 
         self.login()
 
@@ -223,13 +266,10 @@ class Session(requests.Session):
         return bool(self.cookies.get("fssessionid"))
 
     def write_log(self, text, level=logging.INFO):
-        """write text in the log file"""
         logger.log(level, text)
 
     def login(self):
-        """retrieve FamilySearch session ID
-        (https://familysearch.org/developers/docs/guides/oauth2)
-        """
+        """retrieve FamilySearch session ID"""
         while True:
             try:
                 url = "https://www.familysearch.org/auth/familysearch/login"
@@ -319,121 +359,47 @@ class Session(requests.Session):
 
     def get_url(self, url, headers=None, no_api=False, callback=None):
         """retrieve JSON structure from a FamilySearch URL
-        :param callback: if provided, failed requests are queued for background retry
+        :param callback: if provided, request is queued asynchronously
         """
         self.counter += 1
         if headers is None:
             headers = {"Accept": "application/x-gedcomx-v1+json"}
         headers.update(self.headers)
-        base = "https://api.familysearch.org"
-        if no_api:
-            base = "https://familysearch.org"
-        max_retries = self.max_retries
-        retry_count = 0
-        while True:
-            try:
-                r = self.get(base + url, timeout=self.timeout, headers=headers)
-            except requests.exceptions.ReadTimeout:
-                retry_count += 1
-                self.stats.record_retry()
-                if retry_count >= max_retries:
-                    if callback:
-                        self.retry_queue.put(url, headers, callback, 0, no_api)
-                        logger.info("Queued for retry: GET %s -> HTTP %d", url, r.status_code)
-                    else:
-                        self.stats.record_max_retries()
-                        self.write_log(
-                            "GET %s -> Max retries (%d) reached (HTTP %d), giving up"
-                            % (url, max_retries, r.status_code),
-                            level=logging.WARNING,
-                        )
-                    return None
-                backoff = random.uniform(0, min(self.initial_backoff * (2 ** (retry_count - 1)), 300))
-                self.write_log(
-                    "GET %s -> Read timed out (retry %d/%d in %ds)"
-                    % (url, retry_count, max_retries, backoff)
-                )
-                time.sleep(backoff)
-                continue
-            except requests.exceptions.ConnectionError:
-                retry_count += 1
-                self.stats.record_retry()
-                if retry_count >= max_retries:
-                    if callback:
-                        self.retry_queue.put(url, headers, callback, 0, no_api)
-                        logger.info("Queued for retry: GET %s", url)
-                    else:
-                        self.stats.record_max_retries()
-                        self.write_log(
-                            "GET %s -> Max retries (%d) reached, giving up"
-                            % (url, max_retries),
-                            level=logging.WARNING,
-                        )
-                    return None
-                backoff = random.uniform(0, min(self.initial_backoff * (2 ** (retry_count - 1)), 300))
-                self.write_log(
-                    "GET %s -> Connection aborted (retry %d/%d in %ds)"
-                    % (url, retry_count, max_retries, backoff)
-                )
-                time.sleep(backoff)
-                continue
-            self.stats.record_status(r.status_code)
-            if r.status_code == 204:
-                self.write_log("GET %s -> 204" % url)
-                return None
-            if r.status_code in {404, 405, 410, 500}:
-                logger.warning("GET %s -> HTTP %d", url, r.status_code)
-                return None
-            if r.status_code == 401:
-                self.login()
-                continue
-            try:
-                r.raise_for_status()
-            except requests.exceptions.HTTPError:
-                if r.status_code == 403:
-                    if (
-                        "message" in r.json()["errors"][0]
-                        and r.json()["errors"][0]["message"]
-                        == "Unable to get ordinances."
-                    ):
-                        logger.warning(
-                            "Unable to get ordinances. "
-                            "Try with an LDS account or without option -c."
-                        )
-                        return "error"
-                    logger.warning(
-                        "GET %s -> HTTP 403: %s",
-                        url,
-                        r.json()["errors"][0]["message"] or "",
-                    )
-                    return None
-                retry_count += 1
-                self.stats.record_retry()
-                if retry_count >= max_retries:
-                    if callback:
-                        self.retry_queue.put(url, headers, callback, 0, no_api)
-                        logger.info("Queued for retry: GET %s", url)
-                    else:
-                        self.stats.record_max_retries()
-                        self.write_log(
-                            "GET %s -> Max retries (%d) reached, giving up"
-                            % (url, max_retries),
-                            level=logging.WARNING,
-                        )
-                    return None
-                backoff = random.uniform(0, min(self.initial_backoff * (2 ** (retry_count - 1)), 300))
-                self.write_log(
-                    "GET %s -> HTTP %d (retry %d/%d in %ds)"
-                    % (url, r.status_code, retry_count, max_retries, backoff)
-                )
-                time.sleep(backoff)
-                continue
-            try:
-                self.write_log("GET %s -> %d" % (url, r.status_code))
-                return r.json()
-            except Exception as e:
-                self.write_log("GET %s -> Corrupted response: %s" % (url, e), level=logging.WARNING)
-                return None
+
+        if callback is not None:
+            self._request_queue.put(
+                (url, headers, callback, 0, self.max_attempts, 0, None, no_api)
+            )
+            return None
+
+        event = threading.Event()
+        result = [None]
+
+        def sync_callback(data):
+            result[0] = data
+            event.set()
+
+        self._request_queue.put(
+            (url, headers, sync_callback, 0, self.max_attempts, 0, event, no_api)
+        )
+        event.wait(timeout=300)
+        return result[0]
+
+    def stop_workers(self):
+        """Drain the queue, then stop all workers"""
+        deadline = time.time() + 300
+        while self._request_queue.pending > 0 and time.time() < deadline:
+            time.sleep(1)
+        remaining = self._request_queue.pending
+        if remaining:
+            logger.warning("Queue timed out with %d pending requests", remaining)
+        self._stop_workers.set()
+        for w in self._workers:
+            w.join(timeout=2)
+
+    @property
+    def pending(self):
+        return self._request_queue.pending
 
     def set_current(self):
         """retrieve FamilySearch current user ID, name and language"""
@@ -445,9 +411,6 @@ class Session(requests.Session):
             self.display_name = data["users"][0]["displayName"]
 
     def _(self, string):
-        """translate a string into user's language
-        TODO replace translation file for gettext format
-        """
         if string in translations and self.lang in translations[string]:
             return translations[string][self.lang]
         return string

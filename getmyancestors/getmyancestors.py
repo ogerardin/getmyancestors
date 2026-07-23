@@ -131,25 +131,11 @@ def main():
         help="number of threads for concurrent requests [20]",
     )
     parser.add_argument(
-        "--max-retries",
-        metavar="<INT>",
-        type=int,
-        default=8,
-        help="max retries for failed requests [8]",
-    )
-    parser.add_argument(
-        "--retry-delay",
-        metavar="<INT>",
-        type=int,
-        default=30,
-        help="seconds between retry attempts [30]",
-    )
-    parser.add_argument(
-        "--retry-max",
+        "--max-attempts",
         metavar="<INT>",
         type=int,
         default=10,
-        help="max retries in background retry thread [10]",
+        help="max retry attempts per failed request [10]",
     )
     parser.add_argument(
         "--client_id", metavar="<STR>", type=str, help="Use Specific Client ID"
@@ -236,9 +222,7 @@ def main():
         args.timeout,
         args.rate_limit,
         threads=args.threads,
-        max_retries=args.max_retries,
-        retry_delay=args.retry_delay,
-        retry_max=args.retry_max,
+        max_attempts=args.max_attempts,
     )
     if not fs.logged:
         sys.exit(2)
@@ -320,14 +304,11 @@ def main():
         loop.run_until_complete(download_stuff(loop))
 
     finally:
-        # Wait for retry thread to finish recovering failed requests
-        fs.retry_thread.stop()
-        queued = fs.retry_queue.pending
+        # Wait for all workers to drain the request queue
+        queued = fs.pending
         if queued:
-            logger.info("Waiting for retry thread (%d requests still queued)...", queued)
-        fs.retry_thread.join(timeout=300)
-        if fs.retry_queue.pending:
-            logger.warning("Retry thread timed out with %d requests still queued", fs.retry_queue.pending)
+            logger.info("Waiting for %d pending requests...", queued)
+        fs.stop_workers()
 
         # compute number for family relationships and print GEDCOM file
         tree.reset_num()
@@ -347,9 +328,8 @@ def main():
                 str(fs.counter),
             ),
         )
-        retry_remaining = fs.retry_queue.pending
-        logger.info("Statistics: retries=%d, max_retries=%d, retry_queue=%d, status_codes=%s",
-                     fs.stats.retry_count, fs.stats.max_retries_reached, retry_remaining,
+        logger.info("Statistics: retries=%d, max_attempts_reached=%d, status_codes=%s",
+                     fs.stats.retry_count, fs.stats.max_retries_reached,
                      dict(fs.stats.status_codes))
 
 
