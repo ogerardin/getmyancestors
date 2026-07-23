@@ -637,6 +637,7 @@ class Tree:
 
     def __init__(self, fs=None):
         self.fs = fs
+        self.threads = fs.threads if fs else 20
         self.indi = dict()
         self.fam = dict()
         self.notes = list()
@@ -664,7 +665,7 @@ class Tree:
 
         new_fids = [fid for fid in fids if fid and fid not in self.indi]
         loop = asyncio.new_event_loop()
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.threads)
         loop.set_default_executor(executor)
         asyncio.set_event_loop(loop)
         while new_fids:

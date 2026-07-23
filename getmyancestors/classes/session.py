@@ -8,6 +8,7 @@ import webbrowser
 from collections import Counter
 
 import requests
+from requests.adapters import HTTPAdapter
 from fake_useragent import UserAgent
 
 from requests_ratelimiter import LimiterAdapter
@@ -42,16 +43,6 @@ class Stats:
     def elapsed(self):
         return time.time() - self.start_time
 
-    def summary(self):
-        lines = []
-        lines.append("  Retries: %d" % self.retry_count)
-        lines.append("  Max retries reached: %d" % self.max_retries_reached)
-        if self.status_codes:
-            lines.append("  Status codes:")
-            for code, count in sorted(self.status_codes.items()):
-                lines.append("    %d: %d" % (code, count))
-        return "\n".join(lines)
-
 
 class Session(requests.Session):
     """Create a FamilySearch session
@@ -72,6 +63,8 @@ class Session(requests.Session):
         timeout=60,
         rate_limit=None,
         initial_backoff=10,
+        threads=20,
+        max_retries=8,
     ):
         super().__init__()
         self.username = username
@@ -82,13 +75,21 @@ class Session(requests.Session):
         self.logfile = logfile
         self.timeout = timeout
         self.initial_backoff = initial_backoff
+        self.threads = threads
+        self.max_retries = max_retries
         self.fid = self.lang = self.display_name = None
         self.counter = 0
         self.stats = Stats()
         self.headers = {"User-Agent": UserAgent().firefox}
+
+        # Connection pool size matches thread count
+        pool_adapter = HTTPAdapter(pool_connections=threads, pool_maxsize=threads)
+        self.mount('http://', pool_adapter)
+        self.mount('https://', pool_adapter)
+
         self.write_log(
-            "Config: timeout=%ds, initial_backoff=%ds, rate_limit=%s"
-            % (timeout, initial_backoff, rate_limit or "unlimited")
+            "Config: timeout=%ds, initial_backoff=%ds, rate_limit=%s, threads=%d, max_retries=%d"
+            % (timeout, initial_backoff, rate_limit or "unlimited", threads, max_retries)
         )
 
         # Apply a rate-limit (max # requests per second) to all endpoints
@@ -207,12 +208,11 @@ class Session(requests.Session):
         base = "https://api.familysearch.org"
         if no_api:
             base = "https://familysearch.org"
-        max_retries = 5
+        max_retries = self.max_retries
         retry_count = 0
         while True:
             try:
                 r = self.get(base + url, timeout=self.timeout, headers=headers)
-                self.write_log("GET %s -> %d" % (url, r.status_code))
             except requests.exceptions.ReadTimeout:
                 retry_count += 1
                 self.stats.record_retry()
@@ -251,6 +251,7 @@ class Session(requests.Session):
                 continue
             self.stats.record_status(r.status_code)
             if r.status_code == 204:
+                self.write_log("GET %s -> 204" % url)
                 return None
             if r.status_code in {404, 405, 410, 500}:
                 logger.warning("GET %s -> HTTP %d", url, r.status_code)
@@ -296,6 +297,7 @@ class Session(requests.Session):
                 time.sleep(backoff)
                 continue
             try:
+                self.write_log("GET %s -> %d" % (url, r.status_code))
                 return r.json()
             except Exception as e:
                 self.write_log("GET %s -> Corrupted response: %s" % (url, e), level=logging.WARNING)

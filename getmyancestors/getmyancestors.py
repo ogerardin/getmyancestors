@@ -124,6 +124,20 @@ def main():
         help="output log file [stderr]",
     )
     parser.add_argument(
+        "--threads",
+        metavar="<INT>",
+        type=int,
+        default=20,
+        help="number of threads for concurrent requests [20]",
+    )
+    parser.add_argument(
+        "--max-retries",
+        metavar="<INT>",
+        type=int,
+        default=8,
+        help="max retries for failed requests [8]",
+    )
+    parser.add_argument(
         "--client_id", metavar="<STR>", type=str, help="Use Specific Client ID"
     )
     parser.add_argument(
@@ -207,6 +221,8 @@ def main():
         None,  # logfile handled by logging config
         args.timeout,
         args.rate_limit,
+        threads=args.threads,
+        max_retries=args.max_retries,
     )
     if not fs.logged:
         sys.exit(2)
@@ -306,7 +322,9 @@ def main():
                 str(fs.counter),
             ),
         )
-        logger.info("\nStatistics:\n%s", fs.stats.summary())
+        logger.info("Statistics: retries=%d, max_retries=%d, status_codes=%s",
+                     fs.stats.retry_count, fs.stats.max_retries_reached,
+                     dict(fs.stats.status_codes))
 
 
 if __name__ == "__main__":
