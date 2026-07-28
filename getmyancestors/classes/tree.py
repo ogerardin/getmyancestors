@@ -352,7 +352,7 @@ class Indi:
                         )
                     else:
                         self.facts.add(Fact(x, self.tree))
-            if "sources" in data:
+            if "sources" in data and not self.tree.no_sources:
                 def process_sources(sources_data):
                     if sources_data:
                         with self.tree.lock:
@@ -376,6 +376,8 @@ class Indi:
                 )
                 if sources:
                     process_sources(sources)
+            if self.tree.no_memories:
+                return
             for evidence in data.get("evidence", []):
                 memory_id, *_ = evidence["id"].partition("-")
                 url = "/platform/memories/memories/%s" % memory_id
@@ -659,10 +661,12 @@ class Tree:
     :param fs: a Session object
     """
 
-    def __init__(self, fs=None):
+    def __init__(self, fs=None, no_sources=False, no_memories=False):
         self.fs = fs
+        self.no_sources = no_sources
+        self.no_memories = no_memories
         self.lock = threading.Lock()
-        self.threads = fs.threads if fs else 20
+        self.concurrency = fs.concurrency if fs else 20
         self.indi = dict()
         self.fam = dict()
         self.notes = list()
@@ -690,7 +694,7 @@ class Tree:
 
         new_fids = [fid for fid in fids if fid and fid not in self.indi]
         loop = asyncio.new_event_loop()
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.threads)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency)
         loop.set_default_executor(executor)
         asyncio.set_event_loop(loop)
         while new_fids:

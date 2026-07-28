@@ -12,8 +12,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from fake_useragent import UserAgent
 
-from requests_ratelimiter import LimiterAdapter
-
 # local imports
 from getmyancestors.classes.translation import translations
 
@@ -83,7 +81,7 @@ def _worker_loop(session, request_queue, stats, stop_event):
         (url, headers, callback, attempt,
          max_attempts, event, no_api) = item
 
-        # Respect global rate-limit pause (block_until)
+        # Respect global throttle pause (block_until)
         with session._block_lock:
             block_time = session.block_until
         if block_time > time.time():
@@ -133,7 +131,10 @@ def _worker_loop(session, request_queue, stats, stop_event):
         elif r.status_code in {429, 503}:
             retry_after = r.headers.get("Retry-After")
             if retry_after:
-                delay = int(retry_after)
+                try:
+                    delay = int(retry_after)
+                except ValueError:
+                    delay = 10
             elif r.status_code == 503:
                 delay = 10  # default for 503 without Retry-After
             else:
@@ -223,8 +224,7 @@ class Session(requests.Session):
         verbose=False,
         logfile=False,
         timeout=60,
-        rate_limit=None,
-        threads=20,
+        concurrency=20,
         max_attempts=10,
     ):
         super().__init__()
@@ -235,7 +235,7 @@ class Session(requests.Session):
         self.verbose = verbose
         self.logfile = logfile
         self.timeout = timeout
-        self.threads = threads
+        self.concurrency = concurrency
         self.max_attempts = max_attempts
         self.fid = self.lang = self.display_name = None
         self.counter = 0
@@ -244,22 +244,16 @@ class Session(requests.Session):
         self._block_lock = threading.Lock()
         self.headers = {"User-Agent": UserAgent().firefox}
 
-        # Connection pool size matches thread count
-        pool_adapter = HTTPAdapter(pool_connections=threads, pool_maxsize=threads)
+        # Connection pool size matches concurrency
+        pool_adapter = HTTPAdapter(pool_connections=concurrency, pool_maxsize=concurrency)
         self.mount('http://', pool_adapter)
         self.mount('https://', pool_adapter)
-
-        # Apply a rate-limit (max # requests per second) to all endpoints
-        if rate_limit:
-            adapter = LimiterAdapter(per_second=rate_limit)
-            self.mount('http://', adapter)
-            self.mount('https://', adapter)
 
         # Start worker threads (unified pool for requests + retries)
         self._request_queue = RequestQueue()
         self._stop_workers = threading.Event()
         self._workers = []
-        for _ in range(threads):
+        for _ in range(concurrency):
             t = threading.Thread(
                 target=_worker_loop,
                 args=(self, self._request_queue, self.stats, self._stop_workers),
@@ -269,8 +263,8 @@ class Session(requests.Session):
             self._workers.append(t)
 
         self.write_log(
-            "Config: timeout=%ds, rate_limit=%s, threads=%d, max_attempts=%d"
-            % (timeout, rate_limit or "unlimited", threads, max_attempts)
+            "Config: timeout=%ds, concurrency=%d, max_attempts=%d"
+            % (timeout, concurrency, max_attempts)
         )
 
         self.login()

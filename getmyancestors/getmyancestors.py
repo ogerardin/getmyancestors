@@ -90,12 +90,6 @@ def main():
         help="Timeout in seconds [60]",
     )
     parser.add_argument(
-        "--rate-limit",
-        metavar="<INT>",
-        type=int,
-        help="Max # requests per second",
-    )
-    parser.add_argument(
         "--show-password",
         action="store_true",
         default=False,
@@ -124,11 +118,11 @@ def main():
         help="output log file [stderr]",
     )
     parser.add_argument(
-        "--threads",
+        "--concurrency",
         metavar="<INT>",
         type=int,
         default=20,
-        help="number of threads for concurrent requests [20]",
+        help="number of concurrent worker threads [20]",
     )
     parser.add_argument(
         "--max-attempts",
@@ -136,6 +130,24 @@ def main():
         type=int,
         default=10,
         help="max retry attempts per failed request [10]",
+    )
+    parser.add_argument(
+        "--no-sources",
+        action="store_true",
+        default=False,
+        help="Skip downloading sources [False]",
+    )
+    parser.add_argument(
+        "--no-notes",
+        action="store_true",
+        default=False,
+        help="Skip downloading notes [False]",
+    )
+    parser.add_argument(
+        "--no-memories",
+        action="store_true",
+        default=False,
+        help="Skip downloading memories [False]",
     )
     parser.add_argument(
         "--client_id", metavar="<STR>", type=str, help="Use Specific Client ID"
@@ -207,7 +219,7 @@ def main():
         datefmt=log_datefmt,
         handlers=handlers,
     )
-    for name in ("urllib3", "requests_ratelimiter"):
+    for name in ("urllib3",):
         logging.getLogger(name).setLevel(logging.WARNING)
 
     # initialize a FamilySearch session and a family tree object
@@ -220,14 +232,13 @@ def main():
         args.verbose,
         None,  # logfile handled by logging config
         args.timeout,
-        args.rate_limit,
-        threads=args.threads,
+        concurrency=args.concurrency,
         max_attempts=args.max_attempts,
     )
     if not fs.logged:
         sys.exit(2)
     _ = fs._
-    tree = Tree(fs)
+    tree = Tree(fs, no_sources=args.no_sources, no_memories=args.no_memories)
 
     # check LDS account
     if args.get_ordinances:
@@ -278,13 +289,15 @@ def main():
         async def download_stuff(loop):
             futures = set()
             for fid, indi in tree.indi.items():
-                futures.add(loop.run_in_executor(None, indi.get_notes))
+                if not args.no_notes:
+                    futures.add(loop.run_in_executor(None, indi.get_notes))
                 if args.get_ordinances:
                     futures.add(loop.run_in_executor(None, tree.add_ordinances, fid))
                 if args.get_contributors:
                     futures.add(loop.run_in_executor(None, indi.get_contributors))
             for fam in tree.fam.values():
-                futures.add(loop.run_in_executor(None, fam.get_notes))
+                if not args.no_notes:
+                    futures.add(loop.run_in_executor(None, fam.get_notes))
                 if args.get_contributors:
                     futures.add(loop.run_in_executor(None, fam.get_contributors))
             for future in futures:
