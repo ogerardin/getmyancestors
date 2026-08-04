@@ -1,5 +1,3 @@
-# coding: utf-8
-
 # global imports
 from __future__ import print_function
 import re
