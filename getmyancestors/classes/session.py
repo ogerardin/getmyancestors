@@ -277,8 +277,10 @@ class Session(requests.Session):
         logger.log(level, text)
 
     def login(self):
-        """retrieve FamilySearch session ID"""
-        while True:
+        """retrieve FamilySearch session ID
+        (https://familysearch.org/developers/docs/guides/oauth2)
+        """
+        for attempt in range(5):
             try:
                 url = "https://www.familysearch.org/auth/familysearch/login"
                 self.write_log("Downloading: " + url)
@@ -364,6 +366,7 @@ class Session(requests.Session):
             if self.logged:
                 self.set_current()
                 break
+        self.write_log("WARNING: login failed after 5 attempts")
 
     def get_url(self, url, headers=None, no_api=False, callback=None):
         """retrieve JSON structure from a FamilySearch URL

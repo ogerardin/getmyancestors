@@ -4,6 +4,7 @@ import threading
 import time
 import asyncio
 import concurrent.futures
+import itertools
 from urllib.parse import unquote
 
 # global imports
@@ -52,14 +53,13 @@ class Note:
     :param num: the GEDCOM identifier
     """
 
-    counter = 0
+    _counter = itertools.count(1)
 
     def __init__(self, text="", tree=None, num=None):
         if num:
             self.num = num
         else:
-            Note.counter += 1
-            self.num = Note.counter
+            self.num = next(Note._counter)
         self.text = text.strip()
 
         if tree:
@@ -81,14 +81,13 @@ class Source:
     :param num: the GEDCOM identifier
     """
 
-    counter = 0
+    _counter = itertools.count(1)
 
     def __init__(self, data=None, tree=None, num=None):
         if num:
             self.num = num
         else:
-            Source.counter += 1
-            self.num = Source.counter
+            self.num = next(Source._counter)
 
         self.tree = tree
         self.url = self.citation = self.title = self.fid = None
@@ -286,14 +285,13 @@ class Indi:
     :param num: the GEDCOM identifier
     """
 
-    counter = 0
+    _counter = itertools.count(1)
 
     def __init__(self, fid=None, tree=None, num=None):
         if num:
             self.num = num
         else:
-            Indi.counter += 1
-            self.num = Indi.counter
+            self.num = next(Indi._counter)
         self.fid = fid
         self.tree = tree
         self.famc_fid = set()
@@ -530,14 +528,13 @@ class Fam:
     :param num: a GEDCOM identifier
     """
 
-    counter = 0
+    _counter = itertools.count(1)
 
     def __init__(self, husb=None, wife=None, tree=None, num=None):
         if num:
             self.num = num
         else:
-            Fam.counter += 1
-            self.num = Fam.counter
+            self.num = next(Fam._counter)
         self.husb_fid = husb if husb else None
         self.wife_fid = wife if wife else None
         self.tree = tree
