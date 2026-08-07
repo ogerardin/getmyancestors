@@ -29,6 +29,7 @@ class Stats:
         self.status_codes = Counter()
         self.max_retries_reached = 0
         self.start_time = time.time()
+        self.backoff_time = 0.0
 
     def record_status(self, status_code):
         self.status_codes[status_code] += 1
@@ -38,6 +39,9 @@ class Stats:
 
     def record_max_retries(self):
         self.max_retries_reached += 1
+
+    def record_backoff(self, duration):
+        self.backoff_time += duration
 
     def elapsed(self):
         return time.time() - self.start_time
@@ -85,7 +89,9 @@ def _worker_loop(session, request_queue, stats, stop_event):
         with session._block_lock:
             block_time = session.block_until
         if block_time > time.time():
-            time.sleep(block_time - time.time())
+            sleep_dur = block_time - time.time()
+            stats.record_backoff(sleep_dur)
+            time.sleep(sleep_dur)
 
         base = "https://familysearch.org" if no_api else "https://api.familysearch.org"
         try:

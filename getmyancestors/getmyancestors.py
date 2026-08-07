@@ -341,9 +341,9 @@ def main():
                 str(fs.counter),
             ),
         )
-        logger.info("Statistics: retries=%d, max_attempts_reached=%d, status_codes=%s",
+        logger.info("Statistics: retries=%d, max_attempts_reached=%d, backoff_time=%.1fs, status_codes=%s",
                      fs.stats.retry_count, fs.stats.max_retries_reached,
-                     dict(fs.stats.status_codes))
+                     fs.stats.backoff_time / fs.concurrency, dict(fs.stats.status_codes))
 
 
 if __name__ == "__main__":
